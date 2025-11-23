@@ -1,14 +1,14 @@
 use std::{
     fmt::{Debug, Display},
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Write},
     mem,
+    ops::Deref,
     str::FromStr,
     sync::{LazyLock, Mutex},
 };
 
-use anyhow::{Result, anyhow, bail};
-use auto_enums::auto_enum;
+use anyhow::{Result, anyhow};
 use extension_trait::extension_trait;
 use windows::Win32::{
     Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
@@ -87,17 +87,33 @@ pub impl Wftex for WAVEFORMATEX {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum WaveFormat {
     Ex(WAVEFORMATEX),
     Extensible(WAVEFORMATEXTENSIBLE),
 }
 
+impl Deref for WaveFormat {
+    type Target = WAVEFORMATEX;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(self.as_mut_ptr() as *const _) }
+    }
+}
+
+impl Debug for WaveFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ptr = self.as_mut_ptr();
+        unsafe { (*ptr).debug().fmt(f) }
+    }
+}
+
 impl WaveFormat {
-    pub fn as_mut_ptr(&mut self) -> *mut WAVEFORMATEX {
+    pub fn as_mut_ptr(&self) -> *mut WAVEFORMATEX {
         match self {
-            WaveFormat::Ex(waveformatex) => waveformatex,
+            WaveFormat::Ex(waveformatex) => waveformatex as *const _ as *mut _,
             WaveFormat::Extensible(waveformatextensible) => {
-                waveformatextensible as *mut _ as *mut WAVEFORMATEX
+                waveformatextensible as *const _ as *mut WAVEFORMATEX
             }
         }
     }

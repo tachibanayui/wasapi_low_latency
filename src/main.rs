@@ -3,17 +3,14 @@ pub mod utils;
 
 use core::slice;
 use std::{
-    mem,
-    pin::pin,
-    ptr,
-    task::Context,
+    mem, ptr,
     thread::{self, JoinHandle},
     time::Duration,
 };
 use windows_core::Interface;
 
 use anyhow::Result;
-use rtrb::{RingBuffer, chunks::ChunkError};
+use rtrb::{Consumer, Producer, RingBuffer, chunks::ChunkError};
 use tokio::runtime::Runtime;
 use windows::Win32::{
     Media::{
@@ -24,17 +21,16 @@ use windows::Win32::{
             AudioClientProperties, DEVICE_STATE_ACTIVE, EDataFlow, IAudioCaptureClient,
             IAudioClient, IAudioClient3, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
             MMDeviceEnumerator, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture,
-            eRender,
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, eCapture, eRender,
         },
         Multimedia::WAVE_FORMAT_IEEE_FLOAT,
     },
     System::{
         Com::{
             CLSCTX_ALL, COINIT_MULTITHREADED, COINIT_SPEED_OVER_MEMORY, CoCreateInstance,
-            CoInitializeEx, CoTaskMemAlloc, StructuredStorage::PROPVARIANT,
+            CoInitializeEx, StructuredStorage::PROPVARIANT,
         },
-        Threading::{AvSetMmThreadCharacteristicsW, CreateEventW, INFINITE, WaitForSingleObject},
+        Threading::{AvSetMmThreadCharacteristicsW, CreateEventW, WaitForSingleObject},
         Variant::VT_BLOB,
     },
 };
@@ -42,10 +38,11 @@ use windows_strings::{HSTRING, w};
 
 use crate::{
     activate_audio_async::activate_audio_interface_async,
-    utils::{IMMDeviceEx, WaveFormat, Wftex},
+    utils::{IMMDeviceEx, WaveFormat, prompt},
 };
 
-fn spawn<F, T>(name: &str, f: F) -> JoinHandle<T>
+// Spawn a COM multithreaded and set MMCSS Pro Audio task
+pub fn spawn<F, T>(name: &str, f: F) -> JoinHandle<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -72,140 +69,188 @@ fn main() -> Result<()> {
         println!("Choose input type: ");
         println!("1: Device");
         println!("2: Process");
-        let input = match utils::prompt("Choice: ")? {
+        let input = match prompt("Choice: ")? {
             1usize => {
                 println!("Please select input device:");
                 let input = prompt_device(eCapture)?;
                 let input_id = input.GetId()?.to_string()?;
                 Ok(input_id)
             }
-            2usize => Err(utils::prompt("Enter process id to capture: ")?),
-            // I'm too lazy to handle here properly ^^
+            2usize => Err(prompt("Enter process id to capture: ")?),
             _ => panic!("Wrong choice!"),
         };
 
         println!("Please select output device:");
         let output = prompt_device(eRender)?;
         let ac: IAudioClient3 = output.Activate(CLSCTX_ALL, None)?;
-        let mut wfx: WaveFormat = ac.GetMixFormat()?.into();
+        let wfx: WaveFormat = ac.GetMixFormat()?.into();
 
-        let (mut capture, mut render) = RingBuffer::new(48000 * 2);
-        let capture_thd = spawn("capture", move || {
-            let ac = match input {
-                Ok(input_id) => {
-                    let dev_enum: IMMDeviceEnumerator =
-                        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-                    let dev = dev_enum.GetDevice(&HSTRING::from(input_id))?;
-                    let ac: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
-                    ac.cast()?
-                }
-                Err(pid) => {
-                    let rt = Runtime::new().unwrap();
-                    let ac = rt.block_on(process_loopback(pid))?;
-                    ac
-                }
-            };
-
-            println!("Initialising input... ");
-            let info = init_ac(&ac, Some(wfx.as_mut_ptr()))?;
-            let cac: IAudioCaptureClient = ac.GetService()?;
-            'main: loop {
-                WaitForSingleObject(info.ev, INFINITE);
-
-                loop {
-                    let mut cbuf = ptr::null_mut();
-                    let mut ftr = 0;
-                    let mut flags = 0;
-                    cac.GetBuffer(&mut cbuf, &mut ftr, &mut flags, None, None)?;
-                    if flags != 0 {
-                        println!("Capture flag not 0: {flags}");
-                    }
-                    if cbuf.is_null() {
-                        continue;
-                    }
-                    let rbuf = slice::from_raw_parts(cbuf, ftr as usize * info.block as usize);
-                    let slot = match capture.write_chunk_uninit(rbuf.len()) {
-                        Ok(ok) => ok,
-                        Err(ChunkError::TooFewSlots(_)) => {
-                            cac.ReleaseBuffer(0)?;
-                            continue;
-                        }
-                    };
-                    slot.fill_from_iter(rbuf.iter().copied());
-                    cac.ReleaseBuffer(ftr)?;
-
-                    let nps = cac.GetNextPacketSize()?;
-                    if nps == 0 {
-                        continue 'main;
-                    }
-                }
+        let ac_capture = match input {
+            Ok(input_id) => {
+                let dev_enum: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let dev = dev_enum.GetDevice(&HSTRING::from(input_id))?;
+                let ac: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
+                ac.cast()?
             }
+            Err(pid) => {
+                let rt = Runtime::new().unwrap();
+                let ac = rt.block_on(process_loopback(pid))?;
+                ac
+            }
+        };
 
-            #[allow(unreachable_code)]
-            Ok::<_, anyhow::Error>(())
-        });
-
+        let dev_enum: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let output_id = output.GetId()?.to_string()?;
-        let render_thd = spawn("render", move || {
-            let dev_enum: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let dev = dev_enum.GetDevice(&HSTRING::from(output_id))?;
+        let ac_render: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
 
-            let dev = dev_enum.GetDevice(&HSTRING::from(output_id))?;
-            let ac: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
-            println!("Initialising output... ");
-            let info = init_ac(&ac, None)?;
-            let cac: IAudioRenderClient = ac.GetService()?;
-            'main: loop {
-                WaitForSingleObject(info.ev, INFINITE);
-                loop {
-                    let padding = ac.GetCurrentPadding()?;
-                    let available = info.buf_size - padding;
-                    if available == 0 {
-                        continue 'main;
-                    }
-                    let cbuf = cac.GetBuffer(available)?;
-                    let rbuf =
-                        slice::from_raw_parts_mut(cbuf, available as usize * info.block as usize);
-                    let slots = render.slots();
-                    let frames =
-                        slots * 1000 / info.block as usize / (*info.wfx).nSamplesPerSec as usize;
-                    println!("latency atm: {frames}ms");
-                    let can_write = rbuf.len().min(slots);
-                    let slot = render.read_chunk(can_write)?;
-                    let data = slot.as_slices().0;
-                    rbuf[..data.len()].copy_from_slice(data);
-                    cac.ReleaseBuffer(data.len() as u32 / info.block, 0)?;
-                    slot.commit_all();
-                }
-            }
-
-            #[allow(unreachable_code)]
-            return Ok::<_, anyhow::Error>(());
-        });
-
-        dbg!(render_thd.join()).unwrap();
-        dbg!(capture_thd.join()).unwrap();
+        let mut ps = PipeStreamInfo::new(ac_capture, ac_render.cast()?, wfx)?;
+        let mut task_idx = 0;
+        AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_idx).unwrap();
+        println!("Registered for MMCSS Thread: TaskId = {task_idx}");
+        ps.run()?;
         println!("Done");
         Ok(())
     }
 }
 
-struct InitInfo {
-    block: u32,
-    wfx: *mut WAVEFORMATEX,
-    min_period: u32,
+pub struct PipeStreamInfo {
+    capture: Producer<u8>,
+    capture_client: IAudioClient,
+    capture_info: InitInfo,
+    render: Consumer<u8>,
+    render_client: IAudioClient,
+    render_info: InitInfo,
     ev: windows::Win32::Foundation::HANDLE,
-    buf_size: u32,
+    #[allow(unused)]
+    wfx: WaveFormat,
 }
 
-fn init_ac(ac: &IAudioClient, mfx: Option<*mut WAVEFORMATEX>) -> Result<InitInfo> {
+impl PipeStreamInfo {
+    pub fn new(capture: IAudioClient, render: IAudioClient, wfx: WaveFormat) -> Result<Self> {
+        unsafe {
+            let ev = CreateEventW(None, false, false, None)?;
+            println!("Initialising input... ");
+            let capture_info = init_ac(&capture, Some(wfx), ev)?;
+
+            println!("Initialising output... ");
+            let render_info = init_ac(&render, Some(wfx), ev)?;
+            let (capture2, render2) = RingBuffer::new(480000 * 2);
+
+            Ok(Self {
+                capture_client: capture,
+                capture_info,
+                render_client: render,
+                render_info,
+                ev,
+                wfx,
+                capture: capture2,
+                render: render2,
+            })
+        }
+    }
+
+    pub fn run(&mut self) -> Result<()> {
+        unsafe {
+            let cac: IAudioCaptureClient = self.capture_client.GetService()?;
+            let crc: IAudioRenderClient = self.render_client.GetService()?;
+            loop {
+                WaitForSingleObject(self.ev, 2);
+                loop {
+                    while !self.render(&crc)? {}
+                    if self.render.slots() > 0 {
+                        break;
+                    }
+                    if self.capture(&cac)? {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // bool: Wait for signal
+    fn capture(&mut self, cac: &IAudioCaptureClient) -> Result<bool> {
+        unsafe {
+            let mut cbuf = ptr::null_mut();
+            let mut ftr = 0;
+            let mut flags = 0;
+            cac.GetBuffer(&mut cbuf, &mut ftr, &mut flags, None, None)?;
+            if flags != 0 {
+                println!("Capture flag not 0: {flags}");
+            }
+            if cbuf.is_null() {
+                return Ok(true);
+            }
+
+            let rbuf = slice::from_raw_parts(cbuf, ftr as usize * self.capture_info.block as usize);
+            match self.capture.write_chunk_uninit(rbuf.len()) {
+                Ok(slot) => {
+                    slot.fill_from_iter(rbuf.iter().copied());
+                    cac.ReleaseBuffer(ftr)?;
+                }
+                Err(ChunkError::TooFewSlots(_)) => {
+                    cac.ReleaseBuffer(0)?;
+                }
+            };
+
+            let nps = cac.GetNextPacketSize()?;
+            return Ok(nps == 0);
+        }
+    }
+
+    // bool: Wait for signal
+    fn render(&mut self, crc: &IAudioRenderClient) -> Result<bool> {
+        unsafe {
+            let padding = self.render_client.GetCurrentPadding()?;
+            let available = self.render_info.buf_size - padding;
+            if available == 0 {
+                return Ok(true);
+            }
+            let cbuf = crc.GetBuffer(available)?;
+            let rbuf = slice::from_raw_parts_mut(
+                cbuf,
+                available as usize * self.render_info.block as usize,
+            );
+            let slots = self.render.slots();
+            let frames = slots * 1000
+                / self.render_info.block as usize
+                / (*self.render_info.wfx).nSamplesPerSec as usize;
+            if frames > 30 {
+                println!("warn: latency atm: {frames}ms");
+            }
+            let can_write = rbuf.len().min(slots);
+            let slot = self.render.read_chunk(can_write)?;
+            let data = slot.as_slices().0;
+            rbuf[..data.len()].copy_from_slice(data);
+            crc.ReleaseBuffer(data.len() as u32 / self.render_info.block, 0)?;
+            slot.commit_all();
+            return Ok(self.render.slots() == 0);
+        }
+    }
+}
+
+pub struct InitInfo {
+    pub block: u32,
+    pub wfx: WaveFormat,
+    pub min_period: u32,
+    pub buf_size: u32,
+}
+
+fn init_ac(
+    ac: &IAudioClient,
+    wfx: Option<WaveFormat>,
+    ev: windows::Win32::Foundation::HANDLE,
+) -> Result<InitInfo> {
     unsafe {
         let ac3: Option<IAudioClient3> = ac
             .cast()
             .inspect_err(|_| println!("This client does not support IAudioClient3!"))
             .ok();
 
-        let wfx = mfx.unwrap_or(ac.GetMixFormat().unwrap_or_else(|_| {
+        let wfx = wfx.unwrap_or(ac.GetMixFormat().map(|x| x.into()).unwrap_or_else(|_| {
             println!("This client doesnt support GetMixFormat");
             let wfx_new = WAVEFORMATEX {
                 wFormatTag: WAVE_FORMAT_IEEE_FLOAT as u16,
@@ -217,11 +262,9 @@ fn init_ac(ac: &IAudioClient, mfx: Option<*mut WAVEFORMATEX>) -> Result<InitInfo
                 cbSize: 22,
             };
 
-            let wfxptr = CoTaskMemAlloc(mem::size_of_val(&wfx_new)) as *mut WAVEFORMATEX;
-            *wfxptr = wfx_new;
-            wfxptr
+            WaveFormat::Ex(wfx_new)
         }));
-        println!("wave format: {:#?}", (*wfx).debug());
+        println!("wave format: {:#?}", wfx);
 
         let min_period = if let Some(ac) = &ac3 {
             let mut props = AudioClientProperties::default();
@@ -235,7 +278,7 @@ fn init_ac(ac: &IAudioClient, mfx: Option<*mut WAVEFORMATEX>) -> Result<InitInfo
             let mut max_period = 0;
 
             ac.GetSharedModeEnginePeriod(
-                wfx,
+                wfx.as_mut_ptr(),
                 &mut default_period,
                 &mut fundamental_period,
                 &mut min_period,
@@ -251,7 +294,7 @@ fn init_ac(ac: &IAudioClient, mfx: Option<*mut WAVEFORMATEX>) -> Result<InitInfo
             ac.InitializeSharedAudioStream(
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 min_period,
-                wfx,
+                wfx.as_mut_ptr(),
                 None,
             )?;
             min_period
@@ -262,7 +305,7 @@ fn init_ac(ac: &IAudioClient, mfx: Option<*mut WAVEFORMATEX>) -> Result<InitInfo
                 AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 to_reference_time(Duration::from_millis(2)),
                 0,
-                wfx,
+                wfx.as_mut_ptr(),
                 None,
             )?;
             10
@@ -271,14 +314,12 @@ fn init_ac(ac: &IAudioClient, mfx: Option<*mut WAVEFORMATEX>) -> Result<InitInfo
         let bfs = ac.GetBufferSize()?;
         println!("buffer size = {bfs}");
 
-        let ev = CreateEventW(None, false, false, None)?;
         ac.SetEventHandle(ev)?;
         ac.Start()?;
 
         Ok(InitInfo {
             block: (*wfx).nBlockAlign as u32,
             buf_size: bfs,
-            ev: ev,
             min_period,
             wfx,
         })
@@ -309,7 +350,7 @@ fn get_devices(flow: EDataFlow) -> Result<Vec<IMMDevice>> {
 /// `PROPVARIANT` referencing `AUDIOCLIENT_ACTIVATION_PARAMS`! Do not drop it before the returned value
 /// Treat it like into_propvariant(client: &AUDIOCLIENT_ACTIVATION_PARAMS) -> PROPVARIANT + '_
 unsafe fn into_propvariant(client: &AUDIOCLIENT_ACTIVATION_PARAMS) -> PROPVARIANT {
-    use std::{mem, ptr};
+    use std::mem;
 
     let mut p = PROPVARIANT::default();
     // let vt = &p.Anonymous.Anonymous.vt as *const _ as *mut _;

@@ -29,24 +29,26 @@ where
 
     let completionhandler: IActivateAudioInterfaceCompletionHandler =
         AsyncHandler(Mutex::new(Some(handle))).into();
-    let result = ActivateAudioInterfaceAsync(
-        deviceinterfacepath,
-        &Out::IID,
-        activationparams,
-        &completionhandler,
-    )?;
-    future.await?;
+    unsafe {
+        let result = ActivateAudioInterfaceAsync(
+            deviceinterfacepath,
+            &Out::IID,
+            activationparams,
+            &completionhandler,
+        )?;
+        future.await?;
 
-    let mut hr = HRESULT(0);
-    // let mut hr: MaybeUninit<HRESULT> = MaybeUninit::uninit();
-    let mut ai: Option<IUnknown> = None;
-    result.GetActivateResult(&mut hr, &mut ai)?;
+        let mut hr = HRESULT(0);
+        // let mut hr: MaybeUninit<HRESULT> = MaybeUninit::uninit();
+        let mut ai: Option<IUnknown> = None;
+        result.GetActivateResult(&mut hr, &mut ai)?;
 
-    if let Some(comi) = ai {
-        Ok(comi.cast()?)
-    } else {
-        let err = windows::core::Error::from(hr);
-        Err(err.into())
+        if let Some(comi) = ai {
+            Ok(comi.cast()?)
+        } else {
+            let err = windows::core::Error::from(hr);
+            Err(err.into())
+        }
     }
 }
 
