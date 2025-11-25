@@ -11,33 +11,29 @@ use windows_core::Interface;
 
 use anyhow::Result;
 use rtrb::{Consumer, Producer, RingBuffer, chunks::ChunkError};
-use tokio::runtime::Runtime;
 use windows::Win32::{
     Media::{
         Audio::{
             AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS,
-            AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AudioCategory_Media,
-            AudioClientProperties, DEVICE_STATE_ACTIVE, EDataFlow, IAudioCaptureClient,
-            IAudioClient, IAudioClient3, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-            MMDeviceEnumerator, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, eCapture, eRender,
+            AUDCLNT_STREAMFLAGS_LOOPBACK, AudioCategory_Media, AudioClientProperties,
+            DEVICE_STATE_ACTIVE, EDataFlow, IAudioCaptureClient, IAudioClient, IAudioClient3,
+            IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
+            eCapture, eRender,
         },
         Multimedia::WAVE_FORMAT_IEEE_FLOAT,
     },
     System::{
         Com::{
             CLSCTX_ALL, COINIT_MULTITHREADED, COINIT_SPEED_OVER_MEMORY, CoCreateInstance,
-            CoInitializeEx, StructuredStorage::PROPVARIANT,
+            CoInitializeEx,
         },
         Threading::{AvSetMmThreadCharacteristicsW, CreateEventW, WaitForSingleObject},
-        Variant::VT_BLOB,
     },
 };
 use windows_strings::{HSTRING, w};
 
 use crate::{
-    activate_audio_async::activate_audio_interface_async,
+    activate_audio_async::capture_process_sync,
     utils::{IMMDeviceEx, WaveFormat, prompt},
 };
 
@@ -94,8 +90,7 @@ fn main() -> Result<()> {
                 ac.cast()?
             }
             Err(pid) => {
-                let rt = Runtime::new().unwrap();
-                let ac = rt.block_on(process_loopback(pid))?;
+                let ac = capture_process_sync(pid, true)?;
                 ac
             }
         };
@@ -303,7 +298,7 @@ fn init_ac(
             ac.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                to_reference_time(Duration::from_millis(2)),
+                0,
                 0,
                 wfx.as_mut_ptr(),
                 None,
@@ -344,42 +339,6 @@ fn get_devices(flow: EDataFlow) -> Result<Vec<IMMDevice>> {
         let count = devs.GetCount()?;
         let s: Result<Vec<_>, _> = (0..count).map(|x| devs.Item(x)).collect();
         Ok(s?)
-    }
-}
-
-/// `PROPVARIANT` referencing `AUDIOCLIENT_ACTIVATION_PARAMS`! Do not drop it before the returned value
-/// Treat it like into_propvariant(client: &AUDIOCLIENT_ACTIVATION_PARAMS) -> PROPVARIANT + '_
-unsafe fn into_propvariant(client: &AUDIOCLIENT_ACTIVATION_PARAMS) -> PROPVARIANT {
-    use std::mem;
-
-    let mut p = PROPVARIANT::default();
-    // let vt = &p.Anonymous.Anonymous.vt as *const _ as *mut _;
-    // let blob_size = &p.Anonymous.Anonymous.Anonymous.blob.cbSize as *const _ as *mut _;
-    // let blob_data = &p.Anonymous.Anonymous.Anonymous.blob.pBlobData as *const _ as *mut AUDIOCLIENT_ACTIVATION_PARAMS;
-
-    unsafe {
-        (*p.Anonymous.Anonymous).vt = VT_BLOB;
-        (*p.Anonymous.Anonymous).Anonymous.blob.cbSize =
-            mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32;
-        (*p.Anonymous.Anonymous).Anonymous.blob.pBlobData = client as *const _ as *mut u8;
-        p
-    }
-}
-
-async fn process_loopback(proc_no: u32) -> Result<IAudioClient> {
-    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS::default();
-    params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    params.Anonymous.ProcessLoopbackParams.ProcessLoopbackMode =
-        PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
-    params.Anonymous.ProcessLoopbackParams.TargetProcessId = proc_no;
-    unsafe {
-        let pv = into_propvariant(&params);
-        let aud_client: IAudioClient =
-            activate_audio_interface_async(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, Some(&pv))
-                .await
-                .unwrap();
-        mem::forget(pv);
-        Ok(aud_client)
     }
 }
 
